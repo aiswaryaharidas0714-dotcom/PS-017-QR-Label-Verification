@@ -1,229 +1,325 @@
 
+import streamlit as st
 import cv2
+import numpy as np
 import pytesseract
 import re
-from datetime import datetime
+import shutil
 from pathlib import Path
+from PIL import Image, ImageOps
+from io import BytesIO
 from database import connect_database
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Find Tesseract on the hosting system
+tesseract_path = shutil.which("tesseract")
 
-CAPTURE_FOLDER = Path("captured_images")
+if tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+elif Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe").exists():
+    pytesseract.pytesseract.tesseract_cmd = (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    )
+
+st.set_page_config(
+    page_title="PS-017 Label Verification",
+    layout="centered"
+)
+
+MAX_PIXELS = 12_000_000
+MAX_DIMENSION = 1600
 
 def normalize(value):
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
-def capture_label():
-    camera = cv2.VideoCapture(0)
 
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+def load_uploaded_image(uploaded_file):
+    try:
+        image = Image.open(BytesIO(uploaded_file.getvalue()))
 
-    width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if image.width * image.height > MAX_PIXELS:
+            raise ValueError("Image resolution is too large.")
 
-    print("Camera resolution:", width, "x", height)
+        image = ImageOps.exif_transpose(image)
+        image.thumbnail((MAX_DIMENSION, MAX_DIMENSION))
+        image = image.convert("RGB")
 
-    if not camera.isOpened():
-        print("Webcam could not be opened!")
+        image_array = np.array(image)
+        return cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+
+    except Exception as e:
+        st.error(f"Unable to process image: {e}")
         return None
 
-    print("Webcam started!")
-    print("Press C to capture the label.")
-    print("Press Q to quit.")
 
-    captured_image = None
+def verify_appearance(uploaded_image):
+    reference_path = "captured_images/sample_product_label.png"
+    reference_image = cv2.imread(reference_path)
 
-    while True:
-        ret, frame = camera.read()
+    if reference_image is None:
+        return "REVIEW", "Reference label not found."
 
-        if not ret:
-            print("Unable to read webcam!")
-            break
+    if uploaded_image.shape != reference_image.shape:
+        return "REVIEW", "Image dimensions do not match."
 
-        cv2.imshow("QR Label Inspection", frame)
-        key = cv2.waitKey(1) & 0xFF
+    reference_gray = cv2.cvtColor(
+        reference_image, cv2.COLOR_BGR2GRAY
+    )
+    uploaded_gray = cv2.cvtColor(
+        uploaded_image, cv2.COLOR_BGR2GRAY
+    )
 
-        if key == ord("c"):
-            CAPTURE_FOLDER.mkdir(exist_ok=True)
-            filename = "inspection_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
-            captured_image = str(CAPTURE_FOLDER / filename)
-            cv2.imwrite(captured_image, frame)
-            print("Image captured:", captured_image)
-            break
+    difference = cv2.absdiff(reference_gray, uploaded_gray)
 
-        if key == ord("q"):
-            break
+    _, threshold_image = cv2.threshold(
+        difference, 30, 255, cv2.THRESH_BINARY
+    )
 
-    camera.release()
-    cv2.destroyAllWindows()
-    return captured_image
+    changed_pixels = cv2.countNonZero(threshold_image)
+    total_pixels = threshold_image.size
 
-def detect_qr(image):
-    detector = cv2.QRCodeDetector()
+    difference_percentage = (
+        changed_pixels / total_pixels
+    ) * 100
 
-    for scale in [1, 1.5, 2]:
-        resized = cv2.resize(
-            image,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC
-        )
+    if difference_percentage <= 0.5:
+        return "PASS", f"Visual difference: {difference_percentage:.2f}%"
 
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    return "FAIL", f"Visual difference: {difference_percentage:.2f}%"
 
-        methods = [
-            gray,
-            cv2.threshold(
-                gray, 0, 255,
-                cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )[1],
-            cv2.adaptiveThreshold(
-                gray, 255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                31, 5
-            )
-        ]
 
-        for processed in methods:
-            data, points, _ = detector.detectAndDecode(processed)
+def save_inspection(product_id, qr_status, text_status,
+                    appearance_status, final_result, remarks):
 
-            if data:
-                return data, points
+    connection = connect_database()
 
-    return "", None
+    if connection is None:
+        raise RuntimeError("Database connection failed.")
 
-def inspect_label(image_path):
-    image = cv2.imread(image_path)
+    cursor = None
 
-    if image is None:
-        print("Captured image not found!")
-        return
-
-    qr_data, points = detect_qr(image)
-
-    qr_status = "FAIL"
-    text_status = "FAIL"
-    appearance_status = "REVIEW"
-    product_id = None
-    remarks = []
-
-    if qr_data:
-        product_id = qr_data.strip()
-        print("\nQR Data:", product_id)
-
-        connection = connect_database()
+    try:
         cursor = connection.cursor()
 
         cursor.execute(
-            "SELECT * FROM products WHERE product_id = %s",
-            (product_id,)
+            """INSERT INTO inspection_history
+            (product_id, qr_status, text_status,
+             appearance_status, final_result, remarks)
+            VALUES (%s, %s, %s, %s, %s, %s)""",
+            (
+                product_id, qr_status, text_status,
+                appearance_status, final_result, remarks
+            )
         )
 
-        product = cursor.fetchone()
-        cursor.close()
+        connection.commit()
+
+    finally:
+        if cursor:
+            cursor.close()
         connection.close()
 
-        if product:
-            qr_status = "PASS"
-            print("Product found in database!")
 
-            resized = cv2.resize(
-                image,
-                None,
-                fx=2,
-                fy=2,
-                interpolation=cv2.INTER_CUBIC
-            )
+st.title("Automated QR Label Verification")
+st.write("Upload a product label to inspect it.")
 
-            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+uploaded_file = st.file_uploader(
+    "Choose a product label image",
+    type=["jpg", "jpeg", "png"],
+    max_upload_size=5
+)
 
-            gray = cv2.threshold(
-                gray, 0, 255,
-                cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )[1]
+if uploaded_file is not None:
 
-            extracted_text = pytesseract.image_to_string(
-                gray,
-                config="--oem 3 --psm 3"
-            )
+    image = load_uploaded_image(uploaded_file)
 
-            print("\nExtracted OCR Text:")
-            print(extracted_text)
+    if image is not None:
 
-            checks = {
-                "Product Name": product[1],
-                "Batch Number": product[2],
-                "Manufacturing Date": product[3].strftime("%d-%m-%Y"),
-                "Expiry Date": product[4].strftime("%d-%m-%Y")
-            }
+        st.image(
+            cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+            caption="Uploaded Product Label",
+            use_container_width=True
+        )
 
-            print("\nTEXT VERIFICATION:")
+        if st.button("Inspect Product"):
 
-            clean_text = normalize(extracted_text)
-            all_match = True
+            with st.spinner("Inspecting product label..."):
 
-            for field, expected in checks.items():
-                if normalize(expected) in clean_text:
-                    print(field + ": MATCH")
+                detector = cv2.QRCodeDetector()
+                qr_data, points, _ = detector.detectAndDecode(image)
+
+                if not qr_data:
+                    st.error("QR Code Not Detected")
+                    st.stop()
+
+                qr_data = qr_data.strip()
+                st.success("QR Code Detected")
+                st.write("Product ID:", qr_data)
+
+                connection = connect_database()
+
+                if connection is None:
+                    st.error("Database connection failed.")
+                    st.stop()
+
+                cursor = None
+
+                try:
+                    cursor = connection.cursor()
+
+                    cursor.execute(
+                        "SELECT * FROM products WHERE product_id = %s",
+                        (qr_data,)
+                    )
+
+                    product = cursor.fetchone()
+
+                except Exception as e:
+                    st.error(f"Database error: {e}")
+                    st.stop()
+
+                finally:
+                    if cursor:
+                        cursor.close()
+                    connection.close()
+
+                if product is None:
+                    st.error("Product not found in database.")
+                    st.stop()
+
+                st.subheader("Product Details")
+                st.write("Product ID:", product[0])
+                st.write("Product Name:", product[1])
+                st.write("Batch Number:", product[2])
+                st.write("Manufacturing Date:", product[3])
+                st.write("Expiry Date:", product[4])
+
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+                try:
+                    ocr_text = pytesseract.image_to_string(
+                        gray,
+                        config="--oem 3 --psm 6",
+                        timeout=15
+                    )
+                except Exception as e:
+                    st.error(f"OCR processing failed: {e}")
+                    st.stop()
+
+                st.subheader("OCR Extracted Text")
+                st.text(
+                    ocr_text if ocr_text.strip()
+                    else "No text extracted."
+                )
+
+                expected_values = [
+                    str(product[1]),
+                    str(product[2])
+                ]
+
+                normalized_ocr = normalize(ocr_text)
+
+                text_status = (
+                    "PASS"
+                    if all(
+                        normalize(value) in normalized_ocr
+                        for value in expected_values
+                    )
+                    else "REVIEW"
+                )
+
+                qr_status = "PASS"
+
+                appearance_status, appearance_remarks = (
+                    verify_appearance(image)
+                )
+
+                if (
+                    text_status == "FAIL"
+                    or appearance_status == "FAIL"
+                ):
+                    final_result = "FAIL"
+
+                elif (
+                    text_status == "REVIEW"
+                    or appearance_status == "REVIEW"
+                ):
+                    final_result = "REVIEW"
+
                 else:
-                    print(field + ": MISMATCH")
-                    all_match = False
-                    remarks.append(field + " mismatch")
+                    final_result = "PASS"
 
-            text_status = "PASS" if all_match else "FAIL"
+                try:
+                    save_inspection(
+                        qr_data,
+                        qr_status,
+                        text_status,
+                        appearance_status,
+                        final_result,
+                        appearance_remarks
+                    )
 
-            appearance_status = "REVIEW"
-            remarks.append("Appearance verification requires full label alignment")
+                    st.info("Inspection result saved in database.")
 
-        else:
-            remarks.append("Product ID not registered in database")
+                except Exception as e:
+                    st.error(f"Unable to save inspection: {e}")
 
-    else:
-        print("QR Code not detected!")
-        remarks.append("QR code not detected")
+                st.subheader("Inspection Results")
+                st.write("QR Verification:", qr_status)
+                st.write("Text Verification:", text_status)
+                st.write("Appearance Verification:", appearance_status)
+                st.write("Appearance Remarks:", appearance_remarks)
 
-    if qr_status == "FAIL":
-        remarks.append("QR verification failed")
+                if final_result == "PASS":
+                    st.success("Final Result: PASS")
+                elif final_result == "FAIL":
+                    st.error("Final Result: FAIL")
+                else:
+                    st.warning("Final Result: REVIEW")
 
-    if qr_status == "FAIL" or text_status == "FAIL":
-        final_result = "FAIL"
-    else:
-        final_result = "REVIEW"
 
-    connection = connect_database()
-    cursor = connection.cursor()
+st.divider()
+st.subheader("Inspection History")
 
-    cursor.execute("""
-        INSERT INTO inspection_history
-        (product_id, qr_status, text_status, appearance_status,
-         final_result, remarks)
-        VALUES (%s, %s, %s, %s, %s, %s)
-    """, (
-        product_id,
-        qr_status,
-        text_status,
-        appearance_status,
-        final_result,
-        "; ".join(remarks) if remarks else "All checks passed"
-    ))
+history_connection = None
+history_cursor = None
 
-    connection.commit()
+try:
+    history_connection = connect_database()
 
-    print("\n========== INSPECTION RESULT ==========")
-    print("QR Status:", qr_status)
-    print("Text Status:", text_status)
-    print("Appearance Status:", appearance_status)
-    print("FINAL RESULT:", final_result)
-    print("Remarks:", "; ".join(remarks) if remarks else "All checks passed")
-    print("Inspection saved to database!")
+    if history_connection is None:
+        raise RuntimeError("Database connection failed.")
 
-    cursor.close()
-    connection.close()
+    history_cursor = history_connection.cursor()
 
-image_path = capture_label()
+    history_cursor.execute("""
+        SELECT inspection_id, product_id, inspection_date,
+               qr_status, text_status, appearance_status, final_result
+        FROM inspection_history
+        ORDER BY inspection_id DESC
+    """)
 
-if image_path:
-    inspect_label(image_path)
+    history = history_cursor.fetchall()
+
+    st.dataframe(
+        history,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "inspection_id": "Inspection ID",
+            "product_id": "Product ID",
+            "inspection_date": "Inspection Date",
+            "qr_status": "QR Status",
+            "text_status": "Text Status",
+            "appearance_status": "Appearance Status",
+            "final_result": "Final Result"
+        }
+    )
+
+except Exception as e:
+    st.error(f"Unable to load inspection history: {e}")
+
+finally:
+    if history_cursor:
+        history_cursor.close()
+    if history_connection:
+        history_connection.close()
