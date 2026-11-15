@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+captured_images/inspection_*.jpg
+captured_images/label_*.jpg
+captured_images/fake_product_label.png
+altered_product_label.png
+ocr_processed.jpg
+selected_text_region.jpg
