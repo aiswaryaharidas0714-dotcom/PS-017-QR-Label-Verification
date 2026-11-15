@@ -5,8 +5,7 @@ import numpy as np
 import pytesseract
 from database import connect_database
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 st.set_page_config(page_title="PS-017 Label Verification", layout="centered")
 
 def verify_appearance(uploaded_image):
