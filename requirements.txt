@@ -4,3 +4,6 @@ numpy
 pytesseract
 mysql-connector-python
 Pillow
+pandas
+altair
+qrcode
